@@ -68,6 +68,7 @@ class DiskModel(sa.Model):
     disk_model = sa.Column(sa.String(200), nullable=True, default=None)
     disk_rotationrate = sa.Column(sa.Integer(), nullable=True, default=None)
     disk_type = sa.Column(sa.String(20), default='UNKNOWN')
+    disk_kmip_uid = sa.Column(sa.String(255), nullable=True, default=None)
 
 
 class DiskService(CRUDService):
