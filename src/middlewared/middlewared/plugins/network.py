@@ -11,17 +11,20 @@ from collections import defaultdict
 import contextlib
 import ipaddress
 import itertools
-try:
-    import netif
-except ImportError:
-    netif = None
 import os
+import platform
 import re
 import shlex
 import signal
 import socket
 import subprocess
 import urllib.request
+
+
+if platform.system() == "FreeBSD":
+    import netif
+if platform.system() == "Linux":
+    import middlewared.plugins.interface.netif_linux as netif
 
 
 RE_NAMESERVER = re.compile(r'^nameserver\s+(\S+)', re.M)
