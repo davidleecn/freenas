@@ -20,11 +20,12 @@ import socket
 import subprocess
 import urllib.request
 
-
 if platform.system() == "FreeBSD":
     import netif
 if platform.system() == "Linux":
     import middlewared.plugins.interface.netif_linux as netif
+
+from .interface.type_base import InterfaceType
 
 
 RE_NAMESERVER = re.compile(r'^nameserver\s+(\S+)', re.M)
@@ -272,52 +273,6 @@ class NetworkConfigurationService(ConfigService):
         return await self.config()
 
 
-def dhclient_status(interface):
-    """
-    Get the current status of dhclient for a given `interface`.
-
-    Args:
-        interface (str): name of the interface
-
-    Returns:
-        tuple(bool, pid): if dhclient is running follow its pid.
-    """
-    pidfile = '/var/run/dhclient/dhclient.{}.pid'.format(interface)
-    pid = None
-    if os.path.exists(pidfile):
-        with open(pidfile, 'r') as f:
-            try:
-                pid = int(f.read().strip())
-            except ValueError:
-                pass
-
-    running = False
-    if pid:
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            pass
-        else:
-            running = True
-    return running, pid
-
-
-def dhclient_leases(interface):
-    """
-    Reads the leases file for `interface` and returns the content.
-
-    Args:
-        interface (str): name of the interface.
-
-    Returns:
-        str: content of dhclient leases file for `interface`.
-    """
-    leasesfile = '/var/db/dhclient.leases.{}'.format(interface)
-    if os.path.exists(leasesfile):
-        with open(leasesfile, 'r') as f:
-            return f.read()
-
-
 class NetworkAliasModel(sa.Model):
     __tablename__ = 'network_alias'
 
@@ -447,22 +402,13 @@ class InterfaceService(CRUDService):
     @private
     def iface_extend(self, iface_state, configs, is_freenas, fake=False):
 
-        if iface_state['name'].startswith('bridge'):
-            itype = 'BRIDGE'
-        elif iface_state['name'].startswith('lagg'):
-            itype = 'LINK_AGGREGATION'
-        elif iface_state['name'].startswith('vlan'):
-            itype = 'VLAN'
-        elif not iface_state['cloned']:
-            itype = 'PHYSICAL'
-        else:
-            itype = 'UNKNOWN'
+        itype = self.middleware.call_sync('interface.type', iface_state)
 
         iface = {
             'id': iface_state['name'],
             'name': iface_state['name'],
             'fake': fake,
-            'type': itype,
+            'type': itype.value,
             'state': iface_state,
             'aliases': [],
             'ipv4_dhcp': False if configs else True,
@@ -513,7 +459,7 @@ class InterfaceService(CRUDService):
                     'netmask': 32,
                 })
 
-        if iface['name'].startswith('bridge'):
+        if itype == InterfaceType.BRIDGE:
             bridge = self.middleware.call_sync(
                 'datastore.query',
                 'network.bridge',
@@ -524,7 +470,7 @@ class InterfaceService(CRUDService):
                 iface.update({'bridge_members': bridge['members']})
             else:
                 iface.update({'bridge_members': []})
-        elif iface['name'].startswith('lagg'):
+        elif itype == InterfaceType.LINK_AGGREGATION:
             lag = self.middleware.call_sync(
                 'datastore.query',
                 'network.lagginterface',
@@ -543,7 +489,7 @@ class InterfaceService(CRUDService):
                     iface['lag_ports'].append(port['physnic'])
             else:
                 iface['lag_ports'] = []
-        if iface['name'].startswith('vlan'):
+        elif itype == InterfaceType.VLAN:
             vlan = self.middleware.call_sync(
                 'datastore.query',
                 'network.vlan',
@@ -840,7 +786,7 @@ class InterfaceService(CRUDService):
         if data['type'] == 'BRIDGE':
             # For bridge we want to start with 2 because bridge0/bridge1 may have been used
             # for Jails/VM.
-            name = data.get('name') or await self._get_next('bridge', start=2)
+            name = data.get('name') or await self.middleware.call('interface.get_next_name', InterfaceType.BRIDGE)
             try:
                 async for i in self.__create_interface_datastore(data, {
                     'interface': name,
@@ -860,7 +806,8 @@ class InterfaceService(CRUDService):
                         )
                 raise
         elif data['type'] == 'LINK_AGGREGATION':
-            name = data.get('name') or await self._get_next('lagg')
+            name = data.get('name') or await self.middleware.call('interface.get_next_name',
+                                                                  InterfaceType.LINK_AGGREGATION)
             lag_id = None
             lagports_ids = []
             try:
@@ -918,7 +865,8 @@ class InterfaceService(CRUDService):
 
         return await self._get_instance(name)
 
-    async def _get_next(self, prefix, start=0):
+    @private
+    async def get_next(self, prefix, start=0):
         number = start
         ifaces = [
             i['int_interface']
@@ -989,15 +937,11 @@ class InterfaceService(CRUDService):
                             ' on members interfaces.',
                         )
         elif itype == 'BRIDGE':
-            if 'name' in data and not (
-                data['name'].startswith('bridge') and data['name'][6:].isdigit()
-            ):
-                verrors.add(
-                    f'{schema_name}.name',
-                    (
-                        'Bridge interface must start with "bridge" followed by an unique number.'
-                    ),
-                )
+            if 'name' in data:
+                try:
+                    await self.middleware.call('interface.validate_name', InterfaceType.BRIDGE, data['name'])
+                except ValueError as e:
+                    verrors.add(f'{schema_name}.name', str(e))
             if data.get('disable_offload_capabilities'):
                 verrors.add(
                     f'{schema_name}.disable_offload_capabilities',
@@ -1023,15 +967,15 @@ class InterfaceService(CRUDService):
                         f'Interface {member} is currently in use by {vlan_used[member]}.',
                     )
         elif itype == 'LINK_AGGREGATION':
-            if 'name' in data and not (
-                data['name'].startswith('lagg') and data['name'][4:].isdigit()
-            ):
+            if 'name' in data:
+                try:
+                    await self.middleware.call('interface.validate_name', InterfaceType.LINK_AGGREGATION, data['name'])
+                except ValueError as e:
+                    verrors.add(f'{schema_name}.name', str(e))
+            if data['lag_protocol'] not in await self.middleware.call('interface.lagg_supported_protocols'):
                 verrors.add(
-                    f'{schema_name}.name',
-                    (
-                        'Link aggregation interface must start with "lagg" followed by an unique'
-                        'number.'
-                    ),
+                    f'{schema_name}.lag_protocol',
+                    f'{platform.system()} does not support LAGG protocol {data["lag_protocol"]}',
                 )
             for i, member in enumerate(data.get('lag_ports') or []):
                 if member not in ifaces:
@@ -1055,13 +999,11 @@ class InterfaceService(CRUDService):
                     )
 
         elif itype == 'VLAN':
-            if 'name' in data and not (
-                data['name'].startswith('vlan') and data['name'][4:].isdigit()
-            ):
-                verrors.add(
-                    f'{schema_name}.name',
-                    'VLAN interface must start with "vlan" followed by an unique number.',
-                )
+            if 'name' in data:
+                try:
+                    await self.middleware.call('interface.validate_name', InterfaceType.VLAN, data['name'])
+                except ValueError as e:
+                    verrors.add(f'{schema_name}.name', str(e))
             parent = data.get('vlan_parent_interface')
             if parent:
                 if parent not in ifaces:
@@ -1524,7 +1466,7 @@ class InterfaceService(CRUDService):
         )
 
         # Let's finally delete the interface
-        netif.destroy_interface(oid)
+        await self.middleware.call('interface.destroy', oid)
 
         return oid
 
@@ -1547,17 +1489,14 @@ class InterfaceService(CRUDService):
         if not remote_port:
             return
 
-        proc = await Popen(
-            f'sockstat -46|grep ":{remote_port}"',
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        stdout = (await proc.communicate())[0].decode().strip().split()
-        if proc.returncode != 0:
-            return None
-        local_ip = stdout[5].split(':')[0]
-        return local_ip
+        for line in (await run("sockstat", "-46", encoding="utf-8")).stdout.split("\n")[1:]:
+            line = line.split()
+            if platform.system() == "Linux":
+                line.pop()  # STATE column
+            local_address = line[-2]
+            foreign_address = line[-1]
+            if foreign_address.endswith(f":{remote_port}"):
+                return local_address.split(":")[0]
 
     @accepts()
     @pass_app
@@ -1577,9 +1516,10 @@ class InterfaceService(CRUDService):
         Bool('lag_ports', default=False),
         Bool('vlan_parent', default=True),
         List('exclude', default=['epair', 'tap', 'vnet']),
+        List('exclude_types', default=[], items=[Str('type', enum=[type.name for type in InterfaceType])]),
         List('include', default=[]),
     ))
-    def choices(self, options):
+    async def choices(self, options):
         """
         Choices of available network interfaces.
 
@@ -1589,32 +1529,29 @@ class InterfaceService(CRUDService):
         `exclude` is a list of interfaces prefix to remove.
         `include` is a list of interfaces that should not be removed.
         """
-        interfaces = self.middleware.call_sync('interface.query')
+        interfaces = await self.middleware.call('interface.query')
         choices = {i['name']: i['description'] or i['name'] for i in interfaces}
         for interface in interfaces:
             if interface['description'] and interface['description'] != interface['name']:
                 choices[interface['name']] = f'{interface["name"]}: {interface["description"]}'
 
-            for exclude in options['exclude']:
-                if interface['name'].startswith(exclude):
-                    choices.pop(interface['name'], None)
-                    continue
+            if any(interface['name'].startswith(exclude) for exclude in options['exclude']):
+                choices.pop(interface['name'], None)
+            if interface['type'] in options['exclude_types']:
+                choices.pop(interface['name'], None)
             if not options['lag_ports']:
                 if interface['type'] == 'LINK_AGGREGATION':
                     for port in interface['lag_ports']:
                         if port not in options['include']:
                             choices.pop(port, None)
-                            continue
             if not options['bridge_members']:
                 if interface['type'] == 'BRIDGE':
                     for member in interface['bridge_members']:
                         if member not in options['include']:
                             choices.pop(member, None)
-                            continue
             if not options['vlan_parent']:
                 if interface['type'] == 'VLAN':
                     choices.pop(interface['vlan_parent_interface'], None)
-                    continue
         return choices
 
     @accepts(Str('id', null=True, default=None))
@@ -1634,7 +1571,7 @@ class InterfaceService(CRUDService):
         choices = await self.middleware.call('interface.choices', {
             'bridge_members': False,
             'lag_ports': False,
-            'exclude': ['epair', 'tap', 'vnet', 'bridge'],
+            'exclude_types': [InterfaceType.BRIDGE.value],
             'include': include,
         })
         return choices
@@ -1656,7 +1593,7 @@ class InterfaceService(CRUDService):
         choices = await self.middleware.call('interface.choices', {
             'bridge_members': False,
             'lag_ports': False,
-            'exclude': ['epair', 'tap', 'vnet', 'lagg', 'bridge'],
+            'exclude_types': [InterfaceType.BRIDGE.value, InterfaceType.LINK_AGGREGATION.value],
             'include': include,
         })
         return choices
@@ -1670,7 +1607,7 @@ class InterfaceService(CRUDService):
             'bridge_members': True,
             'lag_ports': True,
             'vlan_parent': True,
-            'exclude': ['bridge', 'epair', 'tap', 'vnet', 'vlan'],
+            'exclude_types': [InterfaceType.BRIDGE.value, InterfaceType.VLAN.value],
         })
 
     @private
@@ -1734,117 +1671,27 @@ class InterfaceService(CRUDService):
         laggs = await self.middleware.call('datastore.query', 'network.lagginterface')
         for lagg in laggs:
             name = lagg['lagg_interface']['int_interface']
+            members = await self.middleware.call('datastore.query', 'network.lagginterfacemembers',
+                                                 [('lagg_interfacegroup_id', '=', lagg['id'])])
+            disable_capabilities = name in disable_capabilities_ifaces
+
             cloned_interfaces.append(name)
-            self.logger.info('Setting up {}'.format(name))
-            try:
-                iface = netif.get_interface(name)
-            except KeyError:
-                netif.create_interface(name)
-                iface = netif.get_interface(name)
-
-            if name in disable_capabilities_ifaces:
-                await self.middleware.call('interface.disable_capabilities', name)
-
-            protocol = getattr(netif.AggregationProtocol, lagg['lagg_protocol'].upper())
-            if iface.protocol != protocol:
-                self.logger.info('{}: changing protocol to {}'.format(name, protocol))
-                iface.protocol = protocol
-
-            members_database = set()
-            members_configured = set(p[0] for p in iface.ports)
-            for member in (await self.middleware.call('datastore.query', 'network.lagginterfacemembers', [('lagg_interfacegroup_id', '=', lagg['id'])])):
-                # For Link Aggregation MTU is configured in parent, not ports
-                sync_interface_opts[member['lagg_physnic']]['skip_mtu'] = True
-                members_database.add(member['lagg_physnic'])
-                try:
-                    member_iface = netif.get_interface(member['lagg_physnic'])
-                except KeyError:
-                    self.logger.warn('Could not find {} from {}'.format(member['lagg_physnic'], name))
-                    continue
-
-                lagg_mtu = lagg['lagg_interface']['int_mtu'] or 1500
-                if member_iface.mtu != lagg_mtu:
-                    member_name = member['lagg_physnic']
-                    if member_name in members_configured:
-                        iface.delete_port(member_name)
-                        members_configured.remove(member_name)
-                    member_iface.mtu = lagg_mtu
-
-            # Remove member configured but not in database
-            for member in (members_configured - members_database):
-                iface.delete_port(member)
-
-            # Add member in database but not configured
-            for member in (members_database - members_configured):
-                iface.add_port(member)
-
-            for port in iface.ports:
-                try:
-                    port_iface = netif.get_interface(port[0])
-                except KeyError:
-                    self.logger.warn('Could not find {} from {}'.format(port[0], name))
-                    continue
-                parent_interfaces.append(port[0])
-                port_iface.up()
+            await self.middleware.call('interface.lagg_setup', lagg, members, disable_capabilities,
+                                       cloned_interfaces, parent_interfaces, sync_interface_opts)
 
         vlans = await self.middleware.call('datastore.query', 'network.vlan')
         for vlan in vlans:
+            disable_capabilities = vlan['vlan_vint'] in disable_capabilities_ifaces
+
             cloned_interfaces.append(vlan['vlan_vint'])
-            self.logger.info('Setting up {}'.format(vlan['vlan_vint']))
-            try:
-                iface = netif.get_interface(vlan['vlan_vint'])
-            except KeyError:
-                netif.create_interface(vlan['vlan_vint'])
-                iface = netif.get_interface(vlan['vlan_vint'])
-
-            if vlan['vlan_vint'] in disable_capabilities_ifaces:
-                await self.middleware.call('interface.disable_capabilities', vlan['vlan_vint'])
-
-            if iface.parent != vlan['vlan_pint'] or iface.tag != vlan['vlan_tag'] or iface.pcp != vlan['vlan_pcp']:
-                iface.unconfigure()
-                try:
-                    iface.configure(vlan['vlan_pint'], vlan['vlan_tag'], vlan['vlan_pcp'])
-                except FileNotFoundError:
-                    self.logger.warn(
-                        'VLAN %s parent interface %s not found, skipping.',
-                        vlan['vlan_vint'],
-                        vlan['vlan_pint'],
-                    )
-                    continue
-
-            try:
-                parent_iface = netif.get_interface(iface.parent)
-            except KeyError:
-                self.logger.warn('Could not find {} from {}'.format(iface.parent, vlan['vlan_vint']))
-                continue
-            parent_interfaces.append(iface.parent)
-            parent_iface.up()
+            await self.middleware.call('interface.vlan_setup', vlan, disable_capabilities, parent_interfaces)
 
         bridges = await self.middleware.call('datastore.query', 'network.bridge')
         for bridge in bridges:
             name = bridge['interface']['int_interface']
+
             cloned_interfaces.append(name)
-            self.logger.info(f'Setting up {name}')
-            try:
-                iface = netif.get_interface(name)
-            except KeyError:
-                netif.create_interface(name)
-                iface = netif.get_interface(name)
-
-            members = set(iface.members)
-            members_database = set(bridge['members'])
-
-            for member in members_database - members:
-                try:
-                    iface.add_member(member)
-                except FileNotFoundError:
-                    self.logger.error('Bridge member %s not found', member)
-
-            for member in members - members_database:
-                # These interfaces may be added dynamically for Jails/VMs
-                if member.startswith(('vnet', 'epair', 'tap')):
-                    continue
-                iface.delete_member(member)
+            await self.middleware.call('interface.bridge_setup', bridge)
 
         self.logger.info('Interfaces in database: {}'.format(', '.join(interfaces) or 'NONE'))
         # Configure VLAN before BRIDGE so MTU is configured in correct order
@@ -1863,7 +1710,7 @@ class InterfaceService(CRUDService):
         internal_interfaces = tuple(internal_interfaces)
 
         dhclient_aws = []
-        for name, iface in list(netif.list_interfaces().items()):
+        for name, iface in await self.middleware.run_in_thread(lambda: list(netif.list_interfaces().items())):
             # Skip internal interfaces
             if name.startswith(internal_interfaces):
                 continue
@@ -1874,15 +1721,9 @@ class InterfaceService(CRUDService):
 
             # If there are no interfaces configured we start DHCP on all
             if not interfaces:
-                dhclient_running = dhclient_status(name)[0]
-                if not dhclient_running:
-                    # Make sure interface is UP before starting dhclient
-                    # NAS-103577
-                    if netif.InterfaceFlags.UP not in iface.flags:
-                        iface.up()
-                    dhclient_aws.append(asyncio.ensure_future(
-                        self.dhclient_start(name, wait_dhcp)
-                    ))
+                fut = await self.middleware.call('interface.autoconfigure', iface, wait_dhcp)
+                if fut is not None:
+                    dhclient_aws.append(fut)
             else:
                 # Destroy interfaces which are not in database
 
@@ -1890,21 +1731,9 @@ class InterfaceService(CRUDService):
                 if name in interfaces:
                     continue
 
-                # Interface not in database lose addresses
-                for address in iface.addresses:
-                    iface.remove_address(address)
+                await self.middleware.call('interface.unconfigure', iface, cloned_interfaces, parent_interfaces)
 
-                dhclient_running, dhclient_pid = dhclient_status(name)
-                # Kill dhclient if its running for this interface
-                if dhclient_running:
-                    os.kill(dhclient_pid, signal.SIGTERM)
-
-                # If we have bridge/vlan/lagg not in the database at all
-                # it gets destroy, otherwise just bring it down.
-                if name not in cloned_interfaces and name.startswith(('bridge', 'lagg', 'vlan')):
-                    netif.destroy_interface(name)
-                elif name not in parent_interfaces:
-                    iface.down()
+        await self.middleware.call('interface.apply_configuration')
 
         if wait_dhcp and dhclient_aws:
             await asyncio.wait(dhclient_aws, timeout=30)
@@ -1918,72 +1747,6 @@ class InterfaceService(CRUDService):
         await self.middleware.call_hook('interface.post_sync')
 
     @private
-    async def nic_capabilities(self):
-        return [c for c in netif.InterfaceCapability.__members__]
-
-    @private
-    async def to_disable_evil_nic_capabilities(self, check_iface=True):
-        """
-        When certain NIC's are added to a bridge or other members are added to a bridge when these NIC's are already
-        on the bridge, bridge brings all interfaces into lowest common denominator which results in a network hiccup.
-        This hiccup in case of failover makes backup node come ONLINE as master as there's a hiccup in the
-        master/backup communication. This scenario is common to vnet/nat based jails and VM's, this method checks
-        if the user has such VM's or jails which can bring forward this case and disables certain capabilities for
-        the affected NIC's so that the user is not affected by the interruption which is caused when these NIC's
-        experience a hiccup in the network traffic.
-        """
-        nics = set(await self.middleware.call('jail.nic_capability_checks', None, check_iface))
-        nics.update(await self.middleware.call('vm.device.nic_capability_checks', None, check_iface))
-        return list(nics)
-
-    @private
-    @accepts(Str('iface'), List('capabilities', default=(
-        [c for c in netif.InterfaceCapability.__members__] if netif else []
-    )))
-    def enable_capabilities(self, iface, capabilities):
-        enabled = []
-        iface = netif.get_interface(iface)
-        for capability in map(lambda c: getattr(netif.InterfaceCapability, c), capabilities):
-            current = iface.capabilities
-            if capability in current:
-                continue
-            try:
-                iface.capabilities = current | {capability}
-            except OSError:
-                pass
-            else:
-                enabled.append(capability.name)
-        if enabled:
-            self.middleware.logger.debug(f'Enabled {",".join(enabled)} capabilities for {iface}')
-
-    @private
-    @accepts(
-        Str('iface'),
-        List('capabilities', default=[
-            'TXCSUM', 'TXCSUM_IPV6', 'RXCSUM', 'RXCSUM_IPV6', 'TSO4', 'TSO6', 'VLAN_HWTSO', 'LRO',
-        ])
-    )
-    def disable_capabilities(self, iface, capabilities):
-        self.middleware.call_sync('interface._get_instance', iface)
-        iface = netif.get_interface(iface)
-        disabled_capabilities = [c.name for c in iface.capabilities if c.name in capabilities]
-        iface.capabilities = {c for c in iface.capabilities if c.name not in capabilities}
-        if disabled_capabilities:
-            self.middleware.logger.debug(f'Disabling {",".join(disabled_capabilities)} capabilities for {iface}')
-
-    @private
-    def alias_to_addr(self, alias):
-        addr = netif.InterfaceAddress()
-        ip = ipaddress.ip_interface('{}/{}'.format(alias['address'], alias['netmask']))
-        addr.af = getattr(netif.AddressFamily, 'INET6' if ':' in alias['address'] else 'INET')
-        addr.address = ip.ip
-        addr.netmask = ip.netmask
-        addr.broadcast = ip.network.broadcast_address
-        if 'vhid' in alias:
-            addr.vhid = alias['vhid']
-        return addr
-
-    @private
     async def sync_interface(self, name, wait_dhcp=False, **kwargs):
         try:
             data = await self.middleware.call('datastore.query', 'network.interfaces', [('int_interface', '=', name)], {'get': True})
@@ -1993,187 +1756,7 @@ class InterfaceService(CRUDService):
 
         aliases = await self.middleware.call('datastore.query', 'network.alias', [('alias_interface_id', '=', data['id'])])
 
-        iface = netif.get_interface(name)
-
-        addrs_database = set()
-        addrs_configured = set([
-            a for a in iface.addresses
-            if a.af != netif.AddressFamily.LINK
-        ])
-
-        has_ipv6 = data['int_ipv6auto'] or False
-
-        if (
-            not await self.middleware.call('system.is_freenas') and
-            await self.middleware.call('failover.node') == 'B'
-        ):
-            ipv4_field = 'int_ipv4address_b'
-            ipv6_field = 'int_ipv6address'
-            alias_ipv4_field = 'alias_v4address_b'
-            alias_ipv6_field = 'alias_v6address_b'
-        else:
-            ipv4_field = 'int_ipv4address'
-            ipv6_field = 'int_ipv6address'
-            alias_ipv4_field = 'alias_v4address'
-            alias_ipv6_field = 'alias_v6address'
-
-        dhclient_running, dhclient_pid = dhclient_status(name)
-        if dhclient_running and data['int_dhcp']:
-            leases = dhclient_leases(name)
-            if leases:
-                reg_address = re.search(r'fixed-address\s+(.+);', leases)
-                reg_netmask = re.search(r'option subnet-mask\s+(.+);', leases)
-                if reg_address and reg_netmask:
-                    addrs_database.add(self.alias_to_addr({
-                        'address': reg_address.group(1),
-                        'netmask': reg_netmask.group(1),
-                    }))
-                else:
-                    self.logger.info('Unable to get address from dhclient')
-            if data[ipv6_field] and has_ipv6 is False:
-                addrs_database.add(self.alias_to_addr({
-                    'address': data[ipv6_field],
-                    'netmask': data['int_v6netmaskbit'],
-                }))
-        else:
-            if data[ipv4_field] and not data['int_dhcp']:
-                addrs_database.add(self.alias_to_addr({
-                    'address': data[ipv4_field],
-                    'netmask': data['int_v4netmaskbit'],
-                }))
-            if data[ipv6_field] and has_ipv6 is False:
-                addrs_database.add(self.alias_to_addr({
-                    'address': data[ipv6_field],
-                    'netmask': data['int_v6netmaskbit'],
-                }))
-                has_ipv6 = True
-
-        carp_vhid = carp_pass = None
-        if data['int_vip']:
-            addrs_database.add(self.alias_to_addr({
-                'address': data['int_vip'],
-                'netmask': '32',
-                'vhid': data['int_vhid'],
-            }))
-            carp_vhid = data['int_vhid']
-            carp_pass = data['int_pass'] or None
-
-        for alias in aliases:
-            if alias[alias_ipv4_field]:
-                addrs_database.add(self.alias_to_addr({
-                    'address': alias[alias_ipv4_field],
-                    'netmask': alias['alias_v4netmaskbit'],
-                }))
-            if alias[alias_ipv6_field]:
-                addrs_database.add(self.alias_to_addr({
-                    'address': alias[alias_ipv6_field],
-                    'netmask': alias['alias_v6netmaskbit'],
-                }))
-
-            if alias['alias_vip']:
-                addrs_database.add(self.alias_to_addr({
-                    'address': alias['alias_vip'],
-                    'netmask': '32',
-                    'vhid': data['int_vhid'],
-                }))
-
-        if carp_vhid:
-            advskew = None
-            for cc in iface.carp_config:
-                if cc.vhid == carp_vhid:
-                    advskew = cc.advskew
-                    break
-
-        if has_ipv6:
-            iface.nd6_flags = iface.nd6_flags - {netif.NeighborDiscoveryFlags.IFDISABLED}
-            iface.nd6_flags = iface.nd6_flags | {netif.NeighborDiscoveryFlags.AUTO_LINKLOCAL}
-        else:
-            iface.nd6_flags = iface.nd6_flags | {netif.NeighborDiscoveryFlags.IFDISABLED}
-            iface.nd6_flags = iface.nd6_flags - {netif.NeighborDiscoveryFlags.AUTO_LINKLOCAL}
-
-        # Remove addresses configured and not in database
-        for addr in (addrs_configured - addrs_database):
-            if has_ipv6 and str(addr.address).startswith('fe80::'):
-                continue
-            self.logger.debug('{}: removing {}'.format(name, addr))
-            iface.remove_address(addr)
-
-        # carp must be configured after removing addresses
-        # in case removing the address removes the carp
-        if carp_vhid:
-            if not await self.middleware.call('system.is_freenas') and not advskew:
-                if await self.middleware.call('failover.node') == 'A':
-                    advskew = 20
-                else:
-                    advskew = 80
-            # FIXME: change py-netif to accept str() key
-            iface.carp_config = [netif.CarpConfig(carp_vhid, advskew=advskew, key=carp_pass.encode())]
-
-        # Add addresses in database and not configured
-        for addr in (addrs_database - addrs_configured):
-            self.logger.debug('{}: adding {}'.format(name, addr))
-            iface.add_address(addr)
-
-        # Apply interface options specified in GUI
-        if data['int_options']:
-            self.logger.info('{}: applying {}'.format(name, data['int_options']))
-            proc = await Popen(['/sbin/ifconfig', name] + shlex.split(data['int_options']), stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True)
-            err = (await proc.communicate())[1].decode()
-            if err:
-                self.logger.info('{}: error applying: {}'.format(name, err))
-
-        # In case there is no MTU in interface and it is currently
-        # different than the default of 1500, revert it
-        if not kwargs.get('skip_mtu'):
-            if data['int_mtu']:
-                if iface.mtu != data['int_mtu']:
-                    iface.mtu = data['int_mtu']
-            elif iface.mtu != 1500:
-                iface.mtu = 1500
-
-        if data['int_name'] and iface.description != data['int_name']:
-            try:
-                iface.description = data['int_name']
-            except Exception:
-                self.logger.warn(f'Failed to set interface {name} description', exc_info=True)
-
-        if netif.InterfaceFlags.UP not in iface.flags and 'down' not in data['int_options'].split():
-            iface.up()
-
-        # If dhclient is not running and dhcp is configured, lets start it
-        if not dhclient_running and data['int_dhcp']:
-            self.logger.debug('Starting dhclient for {}'.format(name))
-            dhclient_coro = self.dhclient_start(data['int_interface'], wait_dhcp)
-            if wait_dhcp:
-                await dhclient_coro
-            else:
-                asyncio.ensure_future(dhclient_coro)
-        elif dhclient_running and not data['int_dhcp']:
-            self.logger.debug('Killing dhclient for {}'.format(name))
-            os.kill(dhclient_pid, signal.SIGTERM)
-
-        if data['int_ipv6auto']:
-            iface.nd6_flags = iface.nd6_flags | {netif.NeighborDiscoveryFlags.ACCEPT_RTADV}
-            await (await Popen(
-                ['/etc/rc.d/rtsold', 'onestart'],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                close_fds=True,
-            )).wait()
-        else:
-            iface.nd6_flags = iface.nd6_flags - {netif.NeighborDiscoveryFlags.ACCEPT_RTADV}
-
-    @private
-    async def dhclient_start(self, interface, wait=False):
-        proc = await Popen(
-            ['/sbin/dhclient'] + ([] if wait else ['-b']) + [interface],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, close_fds=True,
-        )
-        output = (await proc.communicate())[0].decode()
-        if proc.returncode != 0:
-            self.logger.error('Failed to run dhclient on {}: {}'.format(
-                interface, output,
-            ))
+        await self.middleware.call('interface.configure', data, aliases, wait_dhcp, **kwargs)
 
     @accepts(
         Dict(
