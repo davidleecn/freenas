@@ -1733,8 +1733,6 @@ class InterfaceService(CRUDService):
 
                 await self.middleware.call('interface.unconfigure', iface, cloned_interfaces, parent_interfaces)
 
-        await self.middleware.call('interface.apply_configuration')
-
         if wait_dhcp and dhclient_aws:
             await asyncio.wait(dhclient_aws, timeout=30)
 
@@ -1877,9 +1875,9 @@ class RouteService(Service):
                     )
                 ]
             for interface in interfaces:
-                dhclient_running, dhclient_pid = dhclient_status(interface)
+                dhclient_running, dhclient_pid = await self.middleware.call('interface.dhclient_status', interface)
                 if dhclient_running:
-                    leases = dhclient_leases(interface)
+                    leases = await self.middleware.call('interface.dhclient_leases', interface)
                     reg_routers = re.search(r'option routers (.+);', leases or '')
                     if reg_routers:
                         # Make sure to get first route only

@@ -5,7 +5,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-__all__ = ['LinkAddress', 'InterfaceAddress']
+__all__ = ['AddressFamily', 'LinkAddress', 'InterfaceAddress']
 
 
 class AddressFamily(enum.IntEnum):

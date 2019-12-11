@@ -4,7 +4,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["InterfaceCapability", "InterfaceFlags", "InterfaceLinkState"]
+__all__ = ["InterfaceCapability", "InterfaceFlags", "InterfaceLinkState", "NeighborDiscoveryFlags"]
 
 
 class InterfaceCapability(enum.IntEnum):
@@ -41,3 +41,14 @@ class InterfaceLinkState(enum.IntEnum):
     LINK_STATE_UNKNOWN = 0
     LINK_STATE_DOWN = 1
     LINK_STATE_UP = 2
+
+
+class NeighborDiscoveryFlags(enum.IntEnum):
+    PERFORMNUD = 0
+    ACCEPT_RTADV = 0
+    PREFER_SOURCE = 0
+    IFDISABLED = 0
+    DONT_SET_IFROUTE = 0
+    AUTO_LINKLOCAL = 0
+    NO_RADR = 0
+    NO_PREFER_IFACE = 0

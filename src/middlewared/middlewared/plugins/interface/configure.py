@@ -5,19 +5,18 @@ import signal
 import subprocess
 import re
 
-import netif
+from .netif import netif
+from .type_base import InterfaceType
 
 from middlewared.service import private, Service
-from middlewared.utils import Popen
-
-from .configure_base import InterfaceConfigureBase
 
 
-class InterfaceService(Service, InterfaceConfigureBase):
+class InterfaceService(Service):
 
     class Config:
         namespace_alias = 'interfaces'
 
+    @private
     def configure(self, data, aliases, wait_dhcp=False, **kwargs):
         name = data['int_interface']
         
@@ -185,6 +184,7 @@ class InterfaceService(Service, InterfaceConfigureBase):
         else:
             iface.nd6_flags = iface.nd6_flags - {netif.NeighborDiscoveryFlags.ACCEPT_RTADV}
 
+    @private
     def autoconfigure(self, iface, wait_dhcp):
         dhclient_running = self.middleware.call_sync('interface.dhclient_status', iface.name)[0]
         if not dhclient_running:
@@ -194,6 +194,7 @@ class InterfaceService(Service, InterfaceConfigureBase):
                 iface.up()
             return self.middleware.call_sync('interface.dhclient_start', iface.name, wait_dhcp, wait=False)
 
+    @private
     def unconfigure(self, iface, cloned_interfaces, parent_interfaces):
         name = iface.name
 
@@ -208,7 +209,10 @@ class InterfaceService(Service, InterfaceConfigureBase):
 
         # If we have bridge/vlan/lagg not in the database at all
         # it gets destroy, otherwise just bring it down.
-        if name not in cloned_interfaces and name.startswith(('bridge', 'lagg', 'vlan')):
+        if (name not in cloned_interfaces and
+                self.middleware.call_sync('interface.type', iface.__getstate__()) in [
+                    InterfaceType.BRIDGE, InterfaceType.LINK_AGGREGATION, InterfaceType.VLAN,
+                ]):
             netif.destroy_interface(name)
         elif name not in parent_interfaces:
             iface.down()
@@ -224,61 +228,3 @@ class InterfaceService(Service, InterfaceConfigureBase):
         if 'vhid' in alias:
             addr.vhid = alias['vhid']
         return addr
-
-    @private
-    async def dhclient_start(self, interface, wait=False):
-        proc = await Popen(
-            ['/sbin/dhclient'] + ([] if wait else ['-b']) + [interface],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, close_fds=True,
-        )
-        output = (await proc.communicate())[0].decode()
-        if proc.returncode != 0:
-            self.logger.error('Failed to run dhclient on {}: {}'.format(
-                interface, output,
-            ))
-
-    @private
-    def dhclient_status(self, interface):
-        """
-        Get the current status of dhclient for a given `interface`.
-
-        Args:
-            interface (str): name of the interface
-
-        Returns:
-            tuple(bool, pid): if dhclient is running follow its pid.
-        """
-        pidfile = '/var/run/dhclient/dhclient.{}.pid'.format(interface)
-        pid = None
-        if os.path.exists(pidfile):
-            with open(pidfile, 'r') as f:
-                try:
-                    pid = int(f.read().strip())
-                except ValueError:
-                    pass
-
-        running = False
-        if pid:
-            try:
-                os.kill(pid, 0)
-            except OSError:
-                pass
-            else:
-                running = True
-        return running, pid
-
-    @private
-    def dhclient_leases(self, interface):
-        """
-        Reads the leases file for `interface` and returns the content.
-
-        Args:
-            interface (str): name of the interface.
-
-        Returns:
-            str: content of dhclient leases file for `interface`.
-        """
-        leasesfile = '/var/db/dhclient.leases.{}'.format(interface)
-        if os.path.exists(leasesfile):
-            with open(leasesfile, 'r') as f:
-                return f.read()

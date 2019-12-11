@@ -1,11 +1,9 @@
-import netif
-
 from middlewared.service import Service
 
-from .bridge_base import InterfaceBridgeBase
+from .netif import netif
 
 
-class InterfaceService(Service, InterfaceBridgeBase):
+class InterfaceService(Service):
 
     class Config:
         namespace_alias = 'interfaces'

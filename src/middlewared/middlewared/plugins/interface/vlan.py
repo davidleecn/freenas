@@ -1,11 +1,11 @@
-import netif
+import platform
 
 from middlewared.service import Service
 
-from .vlan_base import InterfaceVlanBase
+from .netif import netif
 
 
-class InterfaceService(Service, InterfaceVlanBase):
+class InterfaceService(Service):
 
     class Config:
         namespace_alias = 'interfaces'
@@ -15,7 +15,10 @@ class InterfaceService(Service, InterfaceVlanBase):
         try:
             iface = netif.get_interface(vlan['vlan_vint'])
         except KeyError:
-            netif.create_interface(vlan['vlan_vint'])
+            if platform.system() == 'FreeBSD':
+                netif.create_interface(vlan['vlan_vint'])
+            if platform.system() == 'Linux':
+                netif.create_vlan(vlan['vlan_vint'], vlan['vlan_pint'], vlan['vlan_tag'], vlan['vlan_pcp'])
             iface = netif.get_interface(vlan['vlan_vint'])
 
         if disable_capabilities:
