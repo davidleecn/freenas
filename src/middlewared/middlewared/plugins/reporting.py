@@ -1073,11 +1073,16 @@ class RealtimeEventSource(EventSource):
                     addr_data = addr.__getstate__(stats=True)
                     data['interfaces'][iface.name] = {}
                     for k in retrieve_stat_keys:
+                        traffic_stats = addr_data['stats'][k]
+                        if last_interface_stats and last_interface_stats.get(iface.name):
+                            traffic_stats = traffic_stats - last_interface_stats[iface.name][k]
+                            traffic_stats = int(
+                                traffic_stats / (time.time() - last_interface_stats[iface.name][f'{k}_time'])
+                            )
                         data['interfaces'][iface.name].update({
                             k: addr_data['stats'][k],
-                            f'{k}_last': addr_data['stats'][k] - (
-                                0 if not last_interface_stats else last_interface_stats.get(iface.name, {}).get(k, 0)
-                            )
+                            f'{k}_time': time.time(),
+                            f'{k}_traffic': traffic_stats,
                         })
 
             last_interface_stats = data['interfaces'].copy()
